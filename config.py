@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     EXTRACTION_MODEL: str = "gpt-4o-mini"  # For unified extractor
 
     # ============================================================
+    # Tavily (Web Search)
+    # ============================================================
+    TAVILY_API_KEY: str = ""
+    TAVILY_ENABLED: bool = True  # Feature flag to enable/disable web search
+    TAVILY_DEFAULT_SEARCH_DEPTH: str = "basic"  # "basic" or "advanced"
+    TAVILY_MAX_RESULTS: int = 5
+    TAVILY_MAX_TOOL_ITERATIONS: int = 3  # Max agentic loop iterations
+
+    # ============================================================
     # Observability
     # ============================================================
     # OpenTelemetry

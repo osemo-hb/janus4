@@ -23,9 +23,11 @@ from janus3.core.unified_extractor import UnifiedExtractor
 from janus3.core.retrieval import HybridRetriever
 from janus3.core.threshold import AdaptiveThreshold
 from janus3.core.threshold_store import ThresholdStore
+from janus3.core.agentic_chat import AgenticChatHandler
 from janus3.db.connection import close_db_pool, get_db_pool, init_db_pool
 from janus3.db.stm import STMManager
 from janus3.services.llm_service import LLMService
+from janus3.services.tavily_service import TavilyService
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 _redis_client: Optional[redis.Redis] = None
 _threshold_cache: Dict[UUID, AdaptiveThreshold] = {}
 _threshold_store: Optional[ThresholdStore] = None
+_tavily_service: Optional[TavilyService] = None
 
 
 async def get_redis() -> redis.Redis:
@@ -112,6 +115,35 @@ def get_llm_service() -> LLMService:
     return LLMService()
 
 
+def get_tavily_service() -> TavilyService:
+    """
+    Get Tavily service (singleton).
+
+    Returns:
+        TavilyService instance for web search.
+    """
+    global _tavily_service
+
+    if _tavily_service is None:
+        _tavily_service = TavilyService()
+
+    return _tavily_service
+
+
+def get_agentic_handler() -> AgenticChatHandler:
+    """
+    Get agentic chat handler.
+
+    Creates AgenticChatHandler with LLM and Tavily services.
+
+    Returns:
+        AgenticChatHandler instance for tool-enabled chat.
+    """
+    llm = get_llm_service()
+    tavily = get_tavily_service()
+    return AgenticChatHandler(llm.client, tavily)
+
+
 async def get_retriever() -> HybridRetriever:
     """
     Get hybrid retriever with all dependencies.
@@ -185,6 +217,13 @@ async def startup():
     await get_threshold_store()
     logger.info("Threshold store initialized")
 
+    # Initialize Tavily service (if API key configured)
+    if settings.TAVILY_API_KEY:
+        get_tavily_service()
+        logger.info("Tavily service initialized")
+    else:
+        logger.warning("Tavily API key not configured - web search disabled")
+
     # Setup tracing
     from janus3.infra.tracing import setup_tracing
     setup_tracing()
@@ -197,7 +236,15 @@ async def shutdown():
     """
     Application shutdown - cleanup all services.
     """
+    global _tavily_service
+
     logger.info("Shutting down services...")
+
+    # Close Tavily HTTP client
+    if _tavily_service is not None:
+        await _tavily_service.close()
+        _tavily_service = None
+        logger.info("Tavily service closed")
 
     # Close database pool
     await close_db_pool()

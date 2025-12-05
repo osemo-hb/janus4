@@ -33,6 +33,7 @@ from janus3.infra.tracing import tracer
 
 from .dependencies import (
     clear_threshold,
+    get_agentic_handler,
     get_embedder,
     get_llm_service,
     get_redis,
@@ -312,12 +313,31 @@ async def chat(session_id: UUID, request: ChatRequest):
         # 6. Build system prompt with context
         system_prompt = ContextBuilder.build_system_prompt(context)
 
-        # 7. Generate response
+        # 7. Generate response (with optional web search via tool calling)
         with tracer.start_as_current_span("generate_response"):
-            response_text = await llm.chat(
-                system_prompt=system_prompt, user_message=request.content
-            )
+            tool_calls_made = 0
+
+            if settings.TAVILY_ENABLED and settings.TAVILY_API_KEY:
+                # Use agentic handler with web search tools
+                agentic_handler = get_agentic_handler()
+                agentic_response = await agentic_handler.chat(
+                    system_prompt=system_prompt,
+                    user_message=request.content
+                )
+                response_text = agentic_response.content
+                tool_calls_made = agentic_response.tool_calls_made
+
+                if tool_calls_made > 0:
+                    span.set_attribute("tools_used", ",".join(agentic_response.tools_used))
+            else:
+                # Fallback to simple chat (no tools)
+                response_text = await llm.chat(
+                    system_prompt=system_prompt,
+                    user_message=request.content
+                )
+
             span.set_attribute("response_length", len(response_text))
+            span.set_attribute("tool_calls_made", tool_calls_made)
 
         # 8. Store response in STM
         with tracer.start_as_current_span("store_assistant_turn"):

@@ -108,6 +108,52 @@ class LLMService:
 
         return response.choices[0].message.content
 
+    async def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1000
+    ):
+        """
+        Generate a chat completion with optional tool calling.
+
+        Args:
+            messages: List of message dicts (system, user, assistant, tool).
+            tools: Optional list of tool schemas for function calling.
+            temperature: Sampling temperature.
+            max_tokens: Maximum response tokens.
+
+        Returns:
+            Full ChatCompletion response object (not just content).
+            Access response.choices[0].message.tool_calls for tool invocations.
+        """
+        if not self.has_api:
+            return self._mock_tool_response(messages)
+
+        kwargs = {
+            "model": settings.GENERATION_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        return await self.client.chat.completions.create(**kwargs)
+
+    def _mock_tool_response(self, messages: List[Dict]) -> Any:
+        """Generate a mock response for tool-enabled chat."""
+        from unittest.mock import MagicMock
+
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "[Mock Response] API key not configured."
+        mock_response.choices[0].message.tool_calls = None
+        return mock_response
+
     async def generate_json(
         self,
         system_prompt: str,
