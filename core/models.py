@@ -1,7 +1,8 @@
 """
-Pydantic Models for Janus3
+Pydantic Models for Janus 3.5
 
 Type-safe data structures for the memory system.
+Simplified for Janus 3.5 - no versioning on facts.
 """
 
 from pydantic import BaseModel, Field
@@ -20,14 +21,6 @@ class VectorType(str, Enum):
     SUMMARY = "summary"
     CENTROID = "centroid"
     USER_TURN = "user_turn"
-
-
-class FactStatus(str, Enum):
-    """Status of facts in the knowledge graph."""
-    ACTIVE = "active"
-    SUPERSEDED = "superseded"
-    CONFLICTED = "conflicted"
-    RETRACTED = "retracted"
 
 
 # ============================================
@@ -85,32 +78,19 @@ class Episode(BaseModel):
 
 
 class Fact(BaseModel):
-    """Versioned fact in the knowledge graph."""
+    """Fact in the knowledge graph (Janus 3.5 - no versioning)."""
     id: UUID
     session_id: UUID
     subject_entity_id: UUID
     predicate: str
     object: str
-    version: int
     confidence: float = 0.9
-    is_current: bool = True
     source_episode_id: Optional[UUID] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
     class Config:
         frozen = True
-
-
-class Conflict(BaseModel):
-    """Conflict between two facts."""
-    id: UUID
-    session_id: UUID
-    fact_id_1: UUID
-    fact_id_2: UUID
-    resolution_strategy: str = "highest_confidence"
-    resolved: bool = False
-    resolved_value: Optional[str] = None
-    created_at: datetime
 
 
 # ============================================

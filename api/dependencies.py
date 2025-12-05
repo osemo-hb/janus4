@@ -1,28 +1,38 @@
 """
-FastAPI Dependency Injection
+FastAPI Dependency Injection - Janus 3.5
 
 Manages singletons and dependency injection for the API layer.
+
+Simplified for Janus 3.5:
+- Redis for STM (Redis Streams)
+- PostgreSQL for LTM (episodes, entities, facts)
+- Unified extractor for entity/fact extraction
+- OpenTelemetry tracing
 """
 
+import logging
 from functools import lru_cache
-from typing import Optional, Dict
+from typing import Dict, Optional
 from uuid import UUID
 
-import asyncpg
 import redis.asyncio as redis
 
-from config import settings
-from core.embedder import Embedder
-from core.entity_linker import EntityLinker
-from core.retrieval import HybridRetriever
-from core.threshold import AdaptiveThreshold
-from db.connection import init_db_pool, get_db_pool, close_db_pool
-from db.stm import STMManager
-from services.llm_service import LLMService
+from janus3.config import settings
+from janus3.core.embedder import Embedder
+from janus3.core.unified_extractor import UnifiedExtractor
+from janus3.core.retrieval import HybridRetriever
+from janus3.core.threshold import AdaptiveThreshold
+from janus3.core.threshold_store import ThresholdStore
+from janus3.db.connection import close_db_pool, get_db_pool, init_db_pool
+from janus3.db.stm import STMManager
+from janus3.services.llm_service import LLMService
+
+logger = logging.getLogger(__name__)
 
 # Global state
 _redis_client: Optional[redis.Redis] = None
 _threshold_cache: Dict[UUID, AdaptiveThreshold] = {}
+_threshold_store: Optional[ThresholdStore] = None
 
 
 async def get_redis() -> redis.Redis:
@@ -38,9 +48,7 @@ async def get_redis() -> redis.Redis:
 
     if _redis_client is None:
         _redis_client = redis.from_url(
-            settings.REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True
+            settings.REDIS_URL, encoding="utf-8", decode_responses=True
         )
 
     return _redis_client
@@ -55,6 +63,22 @@ async def close_redis():
         _redis_client = None
 
 
+async def get_threshold_store() -> ThresholdStore:
+    """
+    Get Redis-backed threshold store (singleton).
+
+    Returns:
+        ThresholdStore instance for atomic threshold updates.
+    """
+    global _threshold_store
+
+    if _threshold_store is None:
+        redis_client = await get_redis()
+        _threshold_store = ThresholdStore(redis_client)
+
+    return _threshold_store
+
+
 @lru_cache()
 def get_embedder() -> Embedder:
     """
@@ -67,14 +91,14 @@ def get_embedder() -> Embedder:
 
 
 @lru_cache()
-def get_entity_linker() -> EntityLinker:
+def get_unified_extractor() -> UnifiedExtractor:
     """
-    Get entity linker service (singleton).
+    Get unified extractor service (singleton).
 
     Returns:
-        EntityLinker instance.
+        UnifiedExtractor instance for entity/fact/summary extraction.
     """
-    return EntityLinker()
+    return UnifiedExtractor()
 
 
 @lru_cache()
@@ -143,38 +167,51 @@ async def startup():
     """
     Application startup - initialize all services.
     """
-    print("Initializing services...")
+    logger.info("Initializing services (Janus 3.5)...")
 
     # Initialize database pool
     await init_db_pool()
-    print("Database pool initialized.")
+    logger.info("Database pool initialized")
 
     # Initialize Redis client
     await get_redis()
-    print("Redis client initialized.")
+    logger.info("Redis client initialized")
 
-    # Pre-load embedding model (optional, can be lazy)
+    # Pre-load embedding model
     get_embedder()
-    print("Embedder loaded.")
+    logger.info("Embedder loaded")
 
-    print("All services initialized.")
+    # Initialize threshold store
+    await get_threshold_store()
+    logger.info("Threshold store initialized")
+
+    # Setup tracing
+    from janus3.infra.tracing import setup_tracing
+    setup_tracing()
+    logger.info("OpenTelemetry tracing initialized")
+
+    logger.info("All services initialized")
 
 
 async def shutdown():
     """
     Application shutdown - cleanup all services.
     """
-    print("Shutting down services...")
+    logger.info("Shutting down services...")
 
     # Close database pool
     await close_db_pool()
-    print("Database pool closed.")
+    logger.info("Database pool closed")
 
     # Close Redis client
     await close_redis()
-    print("Redis client closed.")
+    logger.info("Redis client closed")
 
     # Clear threshold cache
     _threshold_cache.clear()
 
-    print("All services shut down.")
+    # Shutdown tracing
+    from janus3.infra.tracing import shutdown_tracing
+    shutdown_tracing()
+
+    logger.info("All services shut down")

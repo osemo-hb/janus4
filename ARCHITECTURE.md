@@ -1,13 +1,13 @@
-# Janus3 Architecture Documentation
+# Janus 3.5 Architecture Documentation
 
 ## Executive Summary
 
-**Janus3** is a production-ready, dual-process conversational memory system that combines fast chat responses with asynchronous memory consolidation. It implements a sophisticated memory model with:
+**Janus 3.5** is a streamlined, dual-process conversational memory system that combines fast chat responses with asynchronous memory consolidation. It implements a focused memory model with:
 
 - **Nervous System (FastAPI)**: Handles real-time chat with sub-100ms TTFT
 - **Cortex (Async Consumer)**: Consolidates memories asynchronously
-- **Hybrid Memory**: Combines episodic memory, knowledge graphs, and vector search
-- **Production Patterns**: Crash recovery, adaptive thresholds, parallel retrieval
+- **Unified Extraction**: Single LLM call for entities, facts, and summaries
+- **Simplified Storage**: PostgreSQL + pgvector + Redis Streams (no Neo4j/Kafka)
 
 ---
 
@@ -38,26 +38,38 @@ janus3/
 │   └── dependencies.py      # Dependency injection and singleton management
 │
 ├── consumer/                 # Native asyncio Cortex (consolidation)
-│   ├── cortex.py            # Main consumer loop, topic boundaries, crash recovery
+│   ├── consolidation.py     # ConsolidationService - main consolidation logic
 │   └── run_consumer.py      # Entry point with graceful shutdown
 │
 ├── core/                     # Business logic and ML services
 │   ├── embedder.py          # Thread-safe async embedding service
-│   ├── entity_linker.py     # GLiNER-based named entity extraction
-│   ├── retrieval.py         # Hybrid retrieval (vector + graph)
+│   ├── unified_extractor.py # Single LLM extraction (entities + facts + summary)
+│   ├── model_registry.py    # Embedding model versioning and compatibility
+│   ├── retrieval.py         # Hybrid retrieval (vector search)
 │   ├── threshold.py         # Adaptive semantic boundary detection
+│   ├── threshold_store.py   # Redis-backed threshold persistence
 │   └── models.py            # Pydantic data structures
 │
 ├── db/                       # Database layer (repositories + connection)
 │   ├── connection.py        # asyncpg pool management with pgvector
 │   ├── stm.py               # Redis Streams-based Short-Term Memory
 │   ├── episodes.py          # Episode (LTM) CRUD with multi-vector storage
-│   ├── facts.py             # Versioned knowledge graph facts and entities
+│   ├── facts.py             # Simple facts and entities (no versioning)
 │   └── migrations/          # PostgreSQL schema
-│       └── 001_initial.sql
+│       ├── 001_initial.sql
+│       ├── 002_architecture_refactor.sql
+│       └── 003_simplify_facts.sql  # Janus 3.5 simplification
+│
+├── infra/                    # Infrastructure and observability
+│   ├── tracing.py           # OpenTelemetry distributed tracing
+│   └── metrics.py           # Prometheus metrics collection
 │
 ├── services/                 # External service integrations
-│   └── llm_service.py       # Async OpenAI wrapper
+│   ├── llm_service.py       # Async OpenAI wrapper
+│   └── reconciliation.py    # Data reconciliation utilities
+│
+├── scripts/                  # Utility scripts
+│   └── threshold_update.lua # Lua script for atomic Redis operations
 │
 ├── tests/                    # Test suite
 │   ├── test_threshold.py
@@ -75,9 +87,11 @@ janus3/
 |-----------|---------|---------------------|
 | `api/` | FastAPI Layer | HTTP requests, <100ms TTFT, parallel retrieval |
 | `consumer/` | Async Consumer | Background STM→LTM consolidation |
-| `core/` | Business Logic | Embeddings, entity extraction, retrieval, thresholds |
+| `core/` | Business Logic | Embeddings, unified extraction, retrieval, thresholds |
 | `db/` | Database Layer | Repository pattern, asyncpg, Redis Streams |
+| `infra/` | Observability | Tracing (OpenTelemetry), Metrics (Prometheus) |
 | `services/` | External APIs | OpenAI integration |
+| `scripts/` | Utilities | Lua scripts for Redis atomic operations |
 
 ---
 
@@ -146,20 +160,32 @@ cosine_distance(vec_a: List[float], vec_b: List[float]) → float
 - Singleton pattern ensures single model load per process
 - Thread-safe for concurrent requests
 
-### 2.2 Entity Linker (`core/entity_linker.py`)
+### 2.2 Unified Extractor (`core/unified_extractor.py`)
 
-**Responsibility**: Extract named entities from text
+**Responsibility**: Extract entities, facts, and summary in a single LLM call
 
 | Property | Value |
 |----------|-------|
-| Model | GLiNER (urchade/gliner_base) |
+| Model | gpt-4o-mini (configurable) |
 | Entity Types | person, organization, location, concept, product, event |
-| Pattern | Singleton with lazy loading |
+| Pattern | Singleton with LLMService |
+
+**Replaces** (Janus 3.5 simplification):
+- ~~GLiNER EntityLinker~~
+- ~~spaCy SpaCyExtractor~~
+- ~~LLMFactEnricher~~
+
+**API**:
+```python
+result = await extractor.extract(text)
+# Returns: ExtractionResult(entities, facts, summary)
+```
 
 **Behavior**:
-- Lazy loads model on first entity extraction request
-- Returns empty list if model loading fails (graceful fallback)
-- Uses thread pool execution for non-blocking async
+- Single LLM call extracts all information
+- Truncates text to ~4000 chars to avoid token limits
+- Returns empty result on failure (graceful fallback)
+- Low temperature (0.1) for consistent extraction
 
 ### 2.3 Adaptive Threshold (`core/threshold.py`)
 
@@ -201,7 +227,36 @@ facts = await self._search_graph(entity_ids, session_id)
 3. **Graph traversal** - Facts related to discovered entities
 4. **STM context** - Recent turns for immediate context
 
-### 2.5 STM Manager (`db/stm.py`)
+### 2.5 Model Registry (`core/model_registry.py`)
+
+**Responsibility**: Embedding model versioning and compatibility checking
+
+**Purpose**: Prevents "model soup" issues where vectors from different embedding models are incorrectly compared, leading to poor retrieval quality.
+
+**API**:
+```python
+# Check compatibility before comparison
+if ModelRegistry.can_compare(model_a_id, model_b_id):
+    similarity = cosine_similarity(vec_a, vec_b)
+else:
+    raise IncompatibleModelsError(model_a, model_b)
+```
+
+**Registered Models**:
+| Model ID | Dimensions | Description |
+|----------|------------|-------------|
+| `all-MiniLM-L6-v2` | 384 | Default (fast, good quality) |
+| `all-mpnet-base-v2` | 768 | Higher quality, slower |
+| `text-embedding-ada-002` | 1536 | OpenAI Ada |
+| `text-embedding-3-small` | 1536 | OpenAI v3 small |
+| `text-embedding-3-large` | 3072 | OpenAI v3 large |
+
+**VectorMetadata**: Stored alongside vectors for tracking:
+- `model_id`: Embedding model identifier
+- `model_version`: Model version string
+- `dimension`: Vector dimension
+
+### 2.7 STM Manager (`db/stm.py`)
 
 **Responsibility**: Manage Short-Term Memory in Redis Streams
 
@@ -223,7 +278,7 @@ facts = await self._search_graph(entity_ids, session_id)
 - `timestamp`: ISO timestamp
 - `turn_index`: Sequential turn number
 
-### 2.6 Episode Repository (`db/episodes.py`)
+### 2.8 Episode Repository (`db/episodes.py`)
 
 **Responsibility**: CRUD operations for Long-Term Memory episodes
 
@@ -246,19 +301,17 @@ USING hnsw (embedding vector_cosine_ops)
 WHERE vector_type = 'user_turn';
 ```
 
-### 2.7 Fact Repository (`db/facts.py`)
+### 2.8 Fact Repository (`db/facts.py`)
 
-**Responsibility**: Versioned knowledge graph management
+**Responsibility**: Simple fact storage with upsert (Janus 3.5)
 
-**Versioning Pattern**:
+**Upsert Pattern** (replaces versioning):
 ```sql
--- When updating a fact:
--- 1. Mark old version as not current
-UPDATE facts SET is_current = FALSE
-WHERE subject_entity_id = $1 AND predicate = $2 AND is_current = TRUE;
-
--- 2. Create new version
-INSERT INTO facts (..., version = max_version + 1, is_current = TRUE);
+-- Simple upsert using unique constraint
+INSERT INTO facts (session_id, subject_entity_id, predicate, object, ...)
+VALUES ($1, $2, $3, $4, ...)
+ON CONFLICT (session_id, subject_entity_id, predicate)
+DO UPDATE SET object = $4, updated_at = NOW();
 ```
 
 **Entity Management** (nested EntityRepository):
@@ -266,7 +319,7 @@ INSERT INTO facts (..., version = max_version + 1, is_current = TRUE);
 - Vector similarity search for entity linking
 - UNIQUE constraint on (session_id, name)
 
-### 2.8 LLM Service (`services/llm_service.py`)
+### 2.9 LLM Service (`services/llm_service.py`)
 
 **Responsibility**: OpenAI integration for text generation
 
@@ -282,20 +335,40 @@ INSERT INTO facts (..., version = max_version + 1, is_current = TRUE);
 - Client: `AsyncOpenAI`
 - Fallback: Mock mode when API key unavailable
 
-### 2.9 Cortex Consumer (`consumer/cortex.py`)
+### 2.10 Consolidation Service (`consumer/consolidation.py`)
 
-**Responsibility**: Background consolidation of STM → LTM
+**Responsibility**: Memory consolidation pipeline (Janus 3.5)
 
-**Processing Loop**:
-1. Discover active sessions (24-hour activity window)
-2. Check STM stream length for each session
-3. Trigger consolidation if ≥ `MIN_TURNS_FOR_CONSOLIDATION` (default: 5)
-4. Extract facts via LLM
-5. Create episode with vectors
-6. Acknowledge processed entries
-7. Recover abandoned work via `XAUTOCLAIM`
+**Singleton Pattern**: `await ConsolidationService.get_instance()`
 
-**Entry Point**: `python -m consumer.run_consumer`
+**Simplified Consolidation Flow**:
+```
+Turns Input
+    ↓
+1. Format turns → text block
+2. Unified extraction → UnifiedExtractor (single LLM call)
+   - Extracts entities, facts, and summary together
+3. Generate embeddings:
+   - Summary vector
+   - Centroid vector (mean of user turn vectors)
+   - User turn vectors (first 3 for anchoring)
+4. Create episode → EpisodeRepository (PostgreSQL)
+5. Persist entities/facts → PostgreSQL (simple upsert)
+```
+
+**Key Features**:
+- Single LLM call for extraction (replaces GLiNER + spaCy + LLM enrichment)
+- LLM calls rate-limited via `asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)`
+- OpenTelemetry tracing for each phase
+- Prometheus metrics for consolidation duration and counts
+
+**Configuration**:
+```python
+MIN_TURNS_FOR_CONSOLIDATION = 5
+MAX_CONCURRENT_LLM_CALLS = 5
+MAX_CONCURRENT_CONSOLIDATIONS = 10
+CONSOLIDATION_WORKERS = 4
+```
 
 ---
 
@@ -498,12 +571,69 @@ LIMIT $3;
 
 | Property | Value |
 |----------|-------|
-| Purpose | STM storage, crash recovery |
+| Purpose | STM storage, crash recovery, threshold persistence |
 | Pattern | Redis Streams |
 | Consumer Group | cortex_workers |
 | Max Stream Length | 1000 entries |
 
 **Stream Key**: `stm:{session_id}`
+
+### 5.4 OpenTelemetry Tracing (`infra/tracing.py`)
+
+| Property | Value |
+|----------|-------|
+| Provider | OpenTelemetry SDK |
+| Exporter | OTLP (gRPC) |
+| Feature Flag | `OTEL_ENABLED=true` |
+
+**Auto-instrumented Libraries**:
+- asyncpg (PostgreSQL)
+- redis.asyncio
+
+**Decorators**:
+```python
+@trace_async("operation_name")
+async def my_function():
+    ...
+
+# Or manual spans:
+with tracer.start_as_current_span("operation_name") as span:
+    span.set_attribute("key", "value")
+```
+
+### 5.5 Prometheus Metrics (`infra/metrics.py`)
+
+| Property | Value |
+|----------|-------|
+| Library | prometheus_client |
+| Endpoint | `/metrics` |
+| Feature Flag | `PROMETHEUS_ENABLED=true` |
+
+**Metric Categories**:
+
+| Category | Metrics |
+|----------|---------|
+| **Consolidation** | duration, total, failures, turns_processed, facts_extracted |
+| **Retrieval** | duration, results_count |
+| **LLM** | requests_total, request_duration |
+| **Embedding** | requests_total, duration |
+| **Threshold** | updates, velocity |
+| **API** | requests_total, request_duration |
+
+**Usage**:
+```python
+from janus3.infra.metrics import metrics
+
+# Counter
+metrics.consolidation_total.labels(status="success", trigger_reason="boundary").inc()
+
+# Histogram
+metrics.consolidation_duration.labels(trigger_reason="boundary").observe(1.5)
+
+# Timer context manager
+with metrics.timer(metrics.retrieval_duration, {"retrieval_type": "entity"}):
+    results = await search_entities(...)
+```
 
 ---
 
@@ -555,6 +685,10 @@ STM_CONTEXT_TURNS: int = 10
 ```python
 MIN_TURNS_FOR_CONSOLIDATION: int = 5
 CONSOLIDATION_IDLE_TIMEOUT_MS: int = 60000
+MAX_BUFFER_SIZE: int = 100
+MAX_CONCURRENT_CONSOLIDATIONS: int = 10
+MAX_CONCURRENT_LLM_CALLS: int = 5
+CONSOLIDATION_WORKERS: int = 4
 ```
 
 ### 6.7 LLM Configuration
@@ -564,12 +698,31 @@ OPENAI_API_KEY: str = ""
 GENERATION_MODEL: str = "gpt-4o-mini"
 ```
 
-### 6.8 Entity Extraction Configuration
+### 6.8 Extraction Configuration (Janus 3.5)
 
 ```python
-GLINER_MODEL: str = "urchade/gliner_base"
-GLINER_LABELS: List[str] = ["person", "organization", "location", "concept", "product", "event"]
+EXTRACTION_MODEL: str = "gpt-4o-mini"  # For unified extractor
 ```
+
+*Note: Janus 3.5 uses a unified LLM extractor. GLiNER and spaCy configurations have been removed.*
+
+### 6.9 Observability Configuration
+
+```python
+# OpenTelemetry
+OTEL_ENABLED: bool = True
+OTEL_EXPORTER_OTLP_ENDPOINT: Optional[str] = None  # e.g., "localhost:4317"
+OTEL_SERVICE_NAME: str = "janus3"
+OTEL_CONSOLE_EXPORT: bool = False
+
+# Prometheus
+PROMETHEUS_ENABLED: bool = True
+PROMETHEUS_MULTIPROC_DIR: Optional[str] = None
+```
+
+### 6.10 Feature Flags
+
+*Note: Janus 3.5 has removed migration-related feature flags (`USE_KAFKA`, `USE_NEO4J`, `USE_LEGACY_STM`). The architecture now uses PostgreSQL + Redis Streams exclusively.*
 
 ---
 
@@ -729,20 +882,18 @@ class Embedder:
 
 **Benefit**: Non-blocking async loop, CPU-bound work offloaded
 
-### 8.7 Versioned Facts
+### 8.7 Simple Upsert Facts (Janus 3.5)
 
 **Applied To**: Facts table
 
 ```sql
--- Update existing fact
-UPDATE facts SET is_current = FALSE
-WHERE subject_entity_id = $1 AND predicate = $2 AND is_current = TRUE;
-
--- Create new version
-INSERT INTO facts (..., version = max_version + 1, is_current = TRUE);
+-- Simple upsert using unique constraint
+INSERT INTO facts (session_id, subject_entity_id, predicate, object, ...)
+ON CONFLICT (session_id, subject_entity_id, predicate)
+DO UPDATE SET object = EXCLUDED.object, updated_at = NOW();
 ```
 
-**Benefit**: Fact history preserved, soft-delete semantics
+**Benefit**: Simpler logic, reduced storage, faster queries
 
 ### 8.8 Context Manager Lifespan
 
@@ -757,6 +908,55 @@ async def lifespan(app: FastAPI):
 ```
 
 **Benefit**: Guaranteed cleanup, no orphaned connections
+
+### 8.9 OpenTelemetry Trace Decorator
+
+**Applied To**: All async operations
+
+```python
+@trace_async("operation_name")
+async def my_function(session_id: UUID):
+    # Automatically creates span with session_id attribute
+    pass
+```
+
+**Benefit**: Distributed tracing across services, automatic error recording
+
+### 8.10 Prometheus Metrics Timer
+
+**Applied To**: Performance-critical operations
+
+```python
+with metrics.timer(metrics.consolidation_duration, {"trigger_reason": "boundary"}):
+    await consolidate(session_id)
+```
+
+**Benefit**: Easy latency measurement, Prometheus histograms
+
+### 8.11 Model Registry for Vector Compatibility
+
+**Applied To**: Embedding operations
+
+```python
+if ModelRegistry.can_compare(model_a_id, model_b_id):
+    similarity = cosine_similarity(vec_a, vec_b)
+else:
+    raise IncompatibleModelsError(model_a, model_b)
+```
+
+**Benefit**: Prevents "model soup" from mixing incompatible embeddings
+
+### 8.12 Unified LLM Extraction (Janus 3.5)
+
+**Applied To**: Consolidation pipeline
+
+```python
+# Single LLM call extracts everything
+extraction = await unified_extractor.extract(text)
+# Returns: ExtractionResult(entities, facts, summary)
+```
+
+**Benefit**: Simpler architecture, single LLM call, consistent extraction
 
 ---
 
@@ -827,26 +1027,53 @@ CREATE INDEX idx_entities_embedding ON entities
 USING hnsw (embedding vector_cosine_ops);
 ```
 
-### 9.5 Facts Table
+### 9.5 Facts Table (Janus 3.5 - Simplified)
 
 ```sql
+-- Simplified facts table - no versioning, simple upsert
 CREATE TABLE facts (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
-    subject_entity_id UUID REFERENCES entities(id),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    subject_entity_id UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     predicate VARCHAR(255) NOT NULL,
-    object_value TEXT NOT NULL,
-    confidence FLOAT DEFAULT 1.0,
-    source_episode_id UUID REFERENCES episodes(id),
-    version INT DEFAULT 1,
-    is_current BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT NOW()
+    object TEXT NOT NULL,
+    confidence FLOAT DEFAULT 0.9 CHECK (confidence >= 0 AND confidence <= 1),
+    source_episode_id UUID REFERENCES episodes(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ,
+
+    -- Unique constraint for simple upsert (replaces versioning)
+    CONSTRAINT facts_unique_subject_predicate
+        UNIQUE (session_id, subject_entity_id, predicate)
 );
 
 CREATE INDEX idx_facts_session ON facts(session_id);
 CREATE INDEX idx_facts_subject ON facts(subject_entity_id);
-CREATE INDEX idx_facts_current ON facts(is_current) WHERE is_current = TRUE;
+CREATE INDEX idx_facts_session_subject ON facts(session_id, subject_entity_id);
 ```
+
+*Note: Janus 3.5 removes fact versioning. Facts are now upserted (updated in place) rather than creating new versions.*
+
+### 9.6 Audit Log Table
+
+```sql
+-- Compliance tracking for GDPR and debugging
+CREATE TABLE audit_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES sessions(id) ON DELETE SET NULL,
+    event_type VARCHAR(50) NOT NULL,  -- 'create', 'update', 'delete', 'consolidate'
+    entity_type VARCHAR(50) NOT NULL,  -- 'session', 'episode', 'fact', 'entity'
+    entity_id UUID,
+    details JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_session ON audit_log(session_id);
+CREATE INDEX idx_audit_log_event_type ON audit_log(event_type);
+CREATE INDEX idx_audit_log_created ON audit_log(created_at);
+```
+
+*Note: Janus 3.5 removes `entity_embeddings` (Neo4j bridge), `migration_checkpoints`, and `feature_flags` tables.*
 
 ---
 
@@ -861,6 +1088,7 @@ CREATE INDEX idx_facts_current ON facts(is_current) WHERE is_current = TRUE;
 | Graceful Shutdown | SIGINT/SIGTERM handlers in consumer |
 | Connection Pooling | asyncpg pool (5-20 connections) |
 | Health Checks | `/health` endpoint checks DB and Redis |
+| Idempotent Operations | PostgreSQL ON CONFLICT for upserts |
 
 ### 10.2 Performance Optimizations
 
@@ -869,9 +1097,9 @@ CREATE INDEX idx_facts_current ON facts(is_current) WHERE is_current = TRUE;
 | Parallel Retrieval | Entity + episode searches run simultaneously |
 | Partial HNSW Indexes | O(log N) search for different vector types |
 | Stream Retention | XTRIM MAX~1000 prevents unbounded growth |
-| Lazy Model Loading | GLiNER loads only when needed |
 | Thread Pool Execution | Embeddings off event loop |
-| Batch Operations | Multiple embeddings in single call |
+| LLM Rate Limiting | Semaphore-based concurrency control |
+| Unified Extraction | Single LLM call replaces 3-phase pipeline |
 
 ### 10.3 Scalability Considerations
 
@@ -880,8 +1108,16 @@ CREATE INDEX idx_facts_current ON facts(is_current) WHERE is_current = TRUE;
 | Session Isolation | Each session has own Redis stream + DB records |
 | Stateless API | Multiple API instances behind load balancer |
 | Async Consumer | Single consumer handles multiple sessions |
-| Database Indexing | Indexes on session_id, is_current |
-| Lightweight Thresholds | Per-session in-memory cache |
+| Database Indexing | Indexes on session_id, subject_entity_id |
+| Lightweight Thresholds | Redis-backed persistence with in-memory cache |
+
+### 10.4 Observability Stack
+
+| Component | Purpose |
+|-----------|---------|
+| OpenTelemetry | Distributed tracing across API/Consumer |
+| Prometheus | Metrics collection and alerting |
+| Auto-instrumentation | asyncpg, redis automatically traced |
 
 ---
 
@@ -973,10 +1209,13 @@ curl http://localhost:8000/api/v1/sessions/{id}/facts
 | Async/await everywhere | Max throughput | More complex debugging |
 | pgvector HNSW | Fast approximate search | Not exact, needs tuning |
 | Partial indexes | Multiple vector types | More complex schema |
-| Versioned facts | Preserve history | More storage |
+| Simple upsert facts | Reduced complexity | No history preservation |
 | SentenceTransformer | Lightweight, fast | Lower quality than large models |
-| GLiNER entities | Custom labels | Slower than spaCy |
-| In-memory threshold | Low latency | Lost on restart |
+| Unified LLM extraction | Single call, consistent output | LLM cost per consolidation |
+| Redis threshold store | Persistence across restarts | Redis dependency |
+| PostgreSQL only | Simpler ops, no Neo4j/Kafka | No graph traversal, no event sourcing |
+| Model registry | Prevent embedding mismatch | Version tracking overhead |
+| OpenTelemetry tracing | Full observability | Performance overhead |
 
 ---
 
@@ -985,29 +1224,45 @@ curl http://localhost:8000/api/v1/sessions/{id}/facts
 | Feature | Implementation | Configuration | Tests |
 |---------|---------------|---------------|-------|
 | Chat Flow | `api/routes.py:chat()` | config.py | Manual |
-| Consolidation | `consumer/cortex.py:_consolidate()` | MIN_TURNS_FOR_CONSOLIDATION | N/A |
+| Consolidation | `consumer/consolidation.py` | MIN_TURNS_FOR_CONSOLIDATION | N/A |
 | Boundary Detection | `core/threshold.py` | COLD_START_VELOCITIES | test_threshold.py |
 | Parallel Retrieval | `core/retrieval.py:build_context()` | RETRIEVAL_TOP_K_* | test_parallel_retrieval.py |
+| Unified Extraction | `core/unified_extractor.py` | EXTRACTION_MODEL | N/A |
+| Model Registry | `core/model_registry.py` | EMBEDDING_MODEL_ID | N/A |
 | Vector Storage | `db/episodes.py`, `db/facts.py` | N/A | N/A |
 | STM Management | `db/stm.py` | STM_STREAM_PREFIX | N/A |
-| Entity Extraction | `core/entity_linker.py` | GLINER_* | N/A |
 | LLM Integration | `services/llm_service.py` | OPENAI_API_KEY | N/A |
+| Tracing | `infra/tracing.py` | OTEL_* | N/A |
+| Metrics | `infra/metrics.py` | PROMETHEUS_* | N/A |
 
 ---
 
 ## Summary
 
-Janus3 is a sophisticated, production-ready memory system that elegantly separates concerns between a fast chat API and asynchronous memory consolidation. Key architectural highlights:
+Janus 3.5 is a streamlined, production-ready memory system that elegantly separates concerns between a fast chat API and asynchronous memory consolidation. Key architectural highlights:
 
 1. **Dual-Process Design**: Nervous System (API) + Cortex (Consumer) connected via Redis Streams
-2. **Critical Features**:
+2. **Core Features**:
    - Crash recovery via XAUTOCLAIM
    - Parallelized retrieval with asyncio.gather
    - Partial HNSW indexes for O(log N) search
    - Cold start velocities for stable thresholds
    - Native asyncio consumer (no RQ)
-3. **Type Safety**: Comprehensive Pydantic models
-4. **Scalability**: Stateless API, async consumer, session isolation
-5. **Production Ready**: Graceful shutdown, health checks, error handling
+3. **Unified Extraction** (Janus 3.5):
+   - Single LLM call extracts entities, facts, and summary
+   - Replaces GLiNER + spaCy + LLM enrichment pipeline
+   - Simpler architecture, consistent output
+4. **Simplified Storage** (Janus 3.5):
+   - PostgreSQL + pgvector for all persistent data
+   - Redis Streams for STM and threshold persistence
+   - Simple upsert facts (no versioning)
+   - Removed: Neo4j, Kafka, dual-write, feature flags
+5. **Observability**:
+   - OpenTelemetry distributed tracing
+   - Prometheus metrics for key components
+6. **Model Registry**: Prevents "model soup" from mixing incompatible embeddings
+7. **Type Safety**: Comprehensive Pydantic models
+8. **Scalability**: Stateless API, async consumer, session isolation
+9. **Production Ready**: Graceful shutdown, health checks, audit logging
 
-The architecture achieves <100ms TTFT for chat through parallel retrieval while maintaining persistent, versioned memory through asynchronous consolidation.
+The architecture achieves <100ms TTFT for chat through parallel retrieval while maintaining persistent memory through asynchronous consolidation. Janus 3.5 prioritizes simplicity and operational ease over the flexibility of the previous Neo4j/Kafka-enabled architecture.

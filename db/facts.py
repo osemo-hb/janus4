@@ -1,8 +1,8 @@
 """
-Fact Repository
+Fact Repository - Janus 3.5
 
-Handles versioned facts in the knowledge graph.
-Implements soft-delete versioning with is_current flag.
+Simplified facts with upsert (no versioning).
+Uses ON CONFLICT DO UPDATE for simple overwrite semantics.
 """
 
 from typing import List, Optional
@@ -18,8 +18,8 @@ class FactRepository:
     """
     Repository for fact operations.
 
-    Manages versioned facts with automatic version incrementing
-    and soft-delete via is_current flag.
+    Janus 3.5: Simple upsert with ON CONFLICT DO UPDATE.
+    No versioning - facts are overwritten when updated.
     """
 
     def __init__(self, pool: asyncpg.Pool):
@@ -41,11 +41,10 @@ class FactRepository:
         source_episode_id: Optional[UUID] = None
     ) -> Fact:
         """
-        Upsert a fact with versioning.
+        Upsert a fact with simple overwrite semantics.
 
-        If a fact exists with same subject+predicate:
-        - Mark old fact as not current
-        - Create new fact with incremented version
+        Uses ON CONFLICT DO UPDATE on (session_id, subject_entity_id, predicate).
+        New value overwrites old value - no version history.
 
         Args:
             session_id: Session UUID.
@@ -56,59 +55,42 @@ class FactRepository:
             source_episode_id: Optional source episode.
 
         Returns:
-            Created Fact object.
+            Created or updated Fact object.
         """
         async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                # Mark existing current fact as superseded
-                await conn.execute("""
-                    UPDATE facts
-                    SET is_current = FALSE
-                    WHERE session_id = $1
-                      AND subject_entity_id = $2
-                      AND predicate = $3
-                      AND is_current = TRUE
-                """, session_id, subject_entity_id, predicate)
+            fact_id = uuid4()
+            row = await conn.fetchrow("""
+                INSERT INTO facts
+                (id, session_id, subject_entity_id, predicate, object,
+                 confidence, source_episode_id, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                ON CONFLICT (session_id, subject_entity_id, predicate)
+                DO UPDATE SET
+                    object = EXCLUDED.object,
+                    confidence = EXCLUDED.confidence,
+                    source_episode_id = EXCLUDED.source_episode_id,
+                    updated_at = NOW()
+                RETURNING id, session_id, subject_entity_id, predicate, object,
+                          confidence, source_episode_id, created_at, updated_at
+            """, fact_id, session_id, subject_entity_id, predicate,
+                 object_value, confidence, source_episode_id)
 
-                # Get max version for this subject+predicate
-                max_version = await conn.fetchval("""
-                    SELECT COALESCE(MAX(version), 0)
-                    FROM facts
-                    WHERE session_id = $1
-                      AND subject_entity_id = $2
-                      AND predicate = $3
-                """, session_id, subject_entity_id, predicate)
-
-                # Insert new version
-                fact_id = uuid4()
-                new_version = max_version + 1
-
-                await conn.execute("""
-                    INSERT INTO facts
-                    (id, session_id, subject_entity_id, predicate, object,
-                     version, confidence, is_current, source_episode_id)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8)
-                """, fact_id, session_id, subject_entity_id, predicate,
-                     object_value, new_version, confidence, source_episode_id)
-
-                return Fact(
-                    id=fact_id,
-                    session_id=session_id,
-                    subject_entity_id=subject_entity_id,
-                    predicate=predicate,
-                    object=object_value,
-                    version=new_version,
-                    confidence=confidence,
-                    is_current=True,
-                    source_episode_id=source_episode_id,
-                    created_at=datetime.utcnow()
-                )
+            return Fact(
+                id=row["id"],
+                session_id=row["session_id"],
+                subject_entity_id=row["subject_entity_id"],
+                predicate=row["predicate"],
+                object=row["object"],
+                confidence=row["confidence"],
+                source_episode_id=row["source_episode_id"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"]
+            )
 
     async def get_facts_for_entities(
         self,
         session_id: UUID,
-        entity_ids: List[UUID],
-        current_only: bool = True
+        entity_ids: List[UUID]
     ) -> List[Fact]:
         """
         Get facts for a list of entities.
@@ -116,7 +98,6 @@ class FactRepository:
         Args:
             session_id: Session UUID.
             entity_ids: List of entity UUIDs.
-            current_only: If True, only return current facts.
 
         Returns:
             List of Fact objects.
@@ -125,25 +106,14 @@ class FactRepository:
             return []
 
         async with self.pool.acquire() as conn:
-            if current_only:
-                rows = await conn.fetch("""
-                    SELECT id, session_id, subject_entity_id, predicate, object,
-                           version, confidence, is_current, source_episode_id, created_at
-                    FROM facts
-                    WHERE session_id = $1
-                      AND subject_entity_id = ANY($2)
-                      AND is_current = TRUE
-                    ORDER BY created_at DESC
-                """, session_id, entity_ids)
-            else:
-                rows = await conn.fetch("""
-                    SELECT id, session_id, subject_entity_id, predicate, object,
-                           version, confidence, is_current, source_episode_id, created_at
-                    FROM facts
-                    WHERE session_id = $1
-                      AND subject_entity_id = ANY($2)
-                    ORDER BY version DESC
-                """, session_id, entity_ids)
+            rows = await conn.fetch("""
+                SELECT id, session_id, subject_entity_id, predicate, object,
+                       confidence, source_episode_id, created_at, updated_at
+                FROM facts
+                WHERE session_id = $1
+                  AND subject_entity_id = ANY($2)
+                ORDER BY created_at DESC
+            """, session_id, entity_ids)
 
             return [
                 Fact(
@@ -152,37 +122,35 @@ class FactRepository:
                     subject_entity_id=row["subject_entity_id"],
                     predicate=row["predicate"],
                     object=row["object"],
-                    version=row["version"],
                     confidence=row["confidence"],
-                    is_current=row["is_current"],
                     source_episode_id=row["source_episode_id"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"]
                 )
                 for row in rows
             ]
 
-    async def get_all_current_facts(
+    async def get_all_facts(
         self,
         session_id: UUID,
         limit: int = 100
     ) -> List[Fact]:
         """
-        Get all current facts for a session.
+        Get all facts for a session.
 
         Args:
             session_id: Session UUID.
             limit: Maximum results.
 
         Returns:
-            List of current Fact objects.
+            List of Fact objects.
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT id, session_id, subject_entity_id, predicate, object,
-                       version, confidence, is_current, source_episode_id, created_at
+                       confidence, source_episode_id, created_at, updated_at
                 FROM facts
                 WHERE session_id = $1
-                  AND is_current = TRUE
                 ORDER BY created_at DESC
                 LIMIT $2
             """, session_id, limit)
@@ -194,92 +162,39 @@ class FactRepository:
                     subject_entity_id=row["subject_entity_id"],
                     predicate=row["predicate"],
                     object=row["object"],
-                    version=row["version"],
                     confidence=row["confidence"],
-                    is_current=row["is_current"],
                     source_episode_id=row["source_episode_id"],
-                    created_at=row["created_at"]
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"]
                 )
                 for row in rows
             ]
 
-    async def retract_fact(
+    async def delete_fact(
         self,
         fact_id: UUID
     ) -> bool:
         """
-        Retract a fact (mark as not current).
+        Delete a fact by ID.
 
         Args:
             fact_id: Fact UUID.
 
         Returns:
-            True if fact was retracted.
+            True if fact was deleted.
         """
         async with self.pool.acquire() as conn:
             result = await conn.execute("""
-                UPDATE facts
-                SET is_current = FALSE
-                WHERE id = $1
+                DELETE FROM facts WHERE id = $1
             """, fact_id)
-            return "UPDATE 1" in result
+            return "DELETE 1" in result
 
-    async def get_fact_history(
-        self,
-        session_id: UUID,
-        subject_entity_id: UUID,
-        predicate: str
-    ) -> List[Fact]:
-        """
-        Get version history for a specific fact.
-
-        Args:
-            session_id: Session UUID.
-            subject_entity_id: Entity UUID.
-            predicate: Fact predicate.
-
-        Returns:
-            List of Fact objects ordered by version descending.
-        """
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT id, session_id, subject_entity_id, predicate, object,
-                       version, confidence, is_current, source_episode_id, created_at
-                FROM facts
-                WHERE session_id = $1
-                  AND subject_entity_id = $2
-                  AND predicate = $3
-                ORDER BY version DESC
-            """, session_id, subject_entity_id, predicate)
-
-            return [
-                Fact(
-                    id=row["id"],
-                    session_id=row["session_id"],
-                    subject_entity_id=row["subject_entity_id"],
-                    predicate=row["predicate"],
-                    object=row["object"],
-                    version=row["version"],
-                    confidence=row["confidence"],
-                    is_current=row["is_current"],
-                    source_episode_id=row["source_episode_id"],
-                    created_at=row["created_at"]
-                )
-                for row in rows
-            ]
-
-    async def count_by_session(self, session_id: UUID, current_only: bool = True) -> int:
+    async def count_by_session(self, session_id: UUID) -> int:
         """Get fact count for a session."""
         async with self.pool.acquire() as conn:
-            if current_only:
-                return await conn.fetchval("""
-                    SELECT COUNT(*) FROM facts
-                    WHERE session_id = $1 AND is_current = TRUE
-                """, session_id)
-            else:
-                return await conn.fetchval("""
-                    SELECT COUNT(*) FROM facts WHERE session_id = $1
-                """, session_id)
+            return await conn.fetchval("""
+                SELECT COUNT(*) FROM facts WHERE session_id = $1
+            """, session_id)
 
     async def delete_by_session(self, session_id: UUID) -> int:
         """Delete all facts for a session. Returns count deleted."""
