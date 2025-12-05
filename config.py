@@ -36,12 +36,10 @@ class Settings(BaseSettings):
     THRESHOLD_REDIS_TTL: int = 604800  # 7 days in seconds
 
     # ============================================================
-    # Embeddings
+    # Embeddings (OpenAI text-embedding-3-large)
     # ============================================================
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
-    EMBEDDING_MODEL_ID: str = "all-MiniLM-L6-v2"
-    EMBEDDING_MODEL_VERSION: str = "1.0.0"
-    EMBEDDING_DIM: int = 384
+    EMBEDDING_MODEL: str = "text-embedding-3-large"
+    EMBEDDING_DIM: int = 1536  # Configurable: 256, 512, 1024, 1536, 3072
 
     # ============================================================
     # Adaptive Threshold Configuration
@@ -89,6 +87,29 @@ class Settings(BaseSettings):
     TAVILY_DEFAULT_SEARCH_DEPTH: str = "basic"  # "basic" or "advanced"
     TAVILY_MAX_RESULTS: int = 5
     TAVILY_MAX_TOOL_ITERATIONS: int = 3  # Max agentic loop iterations
+
+    # ============================================================
+    # Topic Detection (LLM-based boundary detection)
+    # ============================================================
+    TOPIC_DETECTION_ENABLED: bool = True
+    TOPIC_DETECTION_MODEL: str = "gpt-4o-mini"
+    TOPIC_DETECTION_CONTEXT_TURNS: int = 4  # Recent turns for context
+
+    # ============================================================
+    # LLM Reranker
+    # ============================================================
+    RERANKER_ENABLED: bool = True
+    RERANKER_MODEL: str = "gpt-4o-mini"
+    RERANKER_TOP_K: int = 5
+    RERANKER_CANDIDATE_MULTIPLIER: int = 3  # Fetch 3x candidates for reranking
+
+    # ============================================================
+    # Memory Distillation
+    # ============================================================
+    DISTILLATION_ENABLED: bool = True
+    DISTILLATION_MODEL: str = "gpt-4o-mini"
+    DISTILLATION_MIN_EPISODES: int = 5  # Min episodes to trigger distillation
+    DISTILLATION_SIMILARITY_THRESHOLD: float = 0.7  # Cluster similarity
 
     # ============================================================
     # Observability

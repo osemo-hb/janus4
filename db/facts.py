@@ -38,7 +38,9 @@ class FactRepository:
         predicate: str,
         object_value: str,
         confidence: float = 0.9,
-        source_episode_id: Optional[UUID] = None
+        source_episode_id: Optional[UUID] = None,
+        canonical_predicate: Optional[str] = None,
+        source_span: Optional[str] = None
     ) -> Fact:
         """
         Upsert a fact with simple overwrite semantics.
@@ -53,6 +55,8 @@ class FactRepository:
             object_value: The fact value.
             confidence: Confidence score (0.0-1.0).
             source_episode_id: Optional source episode.
+            canonical_predicate: Optional schema.org-style predicate (GPT-5.1).
+            source_span: Optional source text for provenance (GPT-5.1).
 
         Returns:
             Created or updated Fact object.
@@ -62,18 +66,22 @@ class FactRepository:
             row = await conn.fetchrow("""
                 INSERT INTO facts
                 (id, session_id, subject_entity_id, predicate, object,
-                 confidence, source_episode_id, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                 confidence, source_episode_id, canonical_predicate, source_span, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                 ON CONFLICT (session_id, subject_entity_id, predicate)
                 DO UPDATE SET
                     object = EXCLUDED.object,
                     confidence = EXCLUDED.confidence,
                     source_episode_id = EXCLUDED.source_episode_id,
+                    canonical_predicate = EXCLUDED.canonical_predicate,
+                    source_span = EXCLUDED.source_span,
                     updated_at = NOW()
                 RETURNING id, session_id, subject_entity_id, predicate, object,
-                          confidence, source_episode_id, created_at, updated_at
+                          confidence, source_episode_id, created_at, updated_at,
+                          canonical_predicate, source_span
             """, fact_id, session_id, subject_entity_id, predicate,
-                 object_value, confidence, source_episode_id)
+                 object_value, confidence, source_episode_id,
+                 canonical_predicate, source_span)
 
             return Fact(
                 id=row["id"],
@@ -84,7 +92,9 @@ class FactRepository:
                 confidence=row["confidence"],
                 source_episode_id=row["source_episode_id"],
                 created_at=row["created_at"],
-                updated_at=row["updated_at"]
+                updated_at=row["updated_at"],
+                canonical_predicate=row.get("canonical_predicate"),
+                source_span=row.get("source_span")
             )
 
     async def get_facts_for_entities(

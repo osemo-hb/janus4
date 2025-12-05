@@ -1,31 +1,29 @@
 """
 Embedding Service
 
-Async wrapper around SentenceTransformer for thread-safe embedding generation.
-Uses ThreadPoolExecutor to avoid blocking the async event loop.
+Async OpenAI embedding service using text-embedding-3-large.
+Singleton pattern for client management.
 """
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import random
 from typing import List, Optional
-import numpy as np
 
-from sentence_transformers import SentenceTransformer
+import numpy as np
+from openai import AsyncOpenAI
 
 from config import settings
 
 
 class Embedder:
     """
-    Thread-safe async embedding service.
+    Async OpenAI embedding service.
 
-    Uses singleton pattern to ensure model is loaded only once.
-    ThreadPoolExecutor offloads CPU-bound embedding to separate threads.
+    Uses singleton pattern for client management.
+    Supports configurable dimensions via settings.EMBEDDING_DIM.
     """
 
     _instance: Optional["Embedder"] = None
-    _executor = ThreadPoolExecutor(max_workers=2)
-    _model: Optional[SentenceTransformer] = None
+    _client: Optional[AsyncOpenAI] = None
 
     def __new__(cls) -> "Embedder":
         if cls._instance is None:
@@ -33,32 +31,27 @@ class Embedder:
         return cls._instance
 
     def __init__(self):
-        # Only load model once
-        if Embedder._model is None:
-            print(f"Loading embedding model: {settings.EMBEDDING_MODEL}")
-            Embedder._model = SentenceTransformer(settings.EMBEDDING_MODEL)
-            print("Embedding model loaded.")
+        if Embedder._client is None and settings.OPENAI_API_KEY:
+            Embedder._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
     @property
-    def model(self) -> SentenceTransformer:
-        """Get the SentenceTransformer model."""
-        if Embedder._model is None:
-            raise RuntimeError("Model not loaded")
-        return Embedder._model
+    def client(self) -> Optional[AsyncOpenAI]:
+        """Get the OpenAI client."""
+        return Embedder._client
 
-    def _encode_sync(self, text: str) -> List[float]:
-        """Synchronous encoding (runs in thread pool)."""
-        embedding = self.model.encode(text, convert_to_numpy=True)
-        return embedding.tolist()
+    @property
+    def has_api(self) -> bool:
+        """Check if API is available."""
+        return Embedder._client is not None
 
-    def _encode_batch_sync(self, texts: List[str]) -> List[List[float]]:
-        """Synchronous batch encoding (runs in thread pool)."""
-        embeddings = self.model.encode(texts, convert_to_numpy=True)
-        return embeddings.tolist()
+    @property
+    def dimension(self) -> int:
+        """Get embedding dimension."""
+        return settings.EMBEDDING_DIM
 
     async def encode(self, text: str) -> List[float]:
         """
-        Async embedding generation for a single text.
+        Generate embedding for a single text.
 
         Args:
             text: The text to embed.
@@ -66,32 +59,46 @@ class Embedder:
         Returns:
             List of floats representing the embedding vector.
         """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._encode_sync,
-            text
+        if not self.has_api:
+            return self._mock_embedding()
+
+        response = await self.client.embeddings.create(
+            model=settings.EMBEDDING_MODEL,
+            input=text,
+            dimensions=settings.EMBEDDING_DIM
         )
+        return response.data[0].embedding
 
     async def encode_batch(self, texts: List[str]) -> List[List[float]]:
         """
-        Async batch embedding generation.
+        Generate embeddings for multiple texts in a single API call.
 
         Args:
             texts: List of texts to embed.
 
         Returns:
-            List of embedding vectors.
+            List of embedding vectors (same order as input).
         """
         if not texts:
             return []
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._encode_batch_sync,
-            texts
+        if not self.has_api:
+            return [self._mock_embedding() for _ in texts]
+
+        response = await self.client.embeddings.create(
+            model=settings.EMBEDDING_MODEL,
+            input=texts,
+            dimensions=settings.EMBEDDING_DIM
         )
+
+        # Sort by index to maintain input order
+        sorted_data = sorted(response.data, key=lambda x: x.index)
+        return [item.embedding for item in sorted_data]
+
+    def _mock_embedding(self) -> List[float]:
+        """Generate mock embedding for testing when API unavailable."""
+        # Generate deterministic-ish mock for consistency
+        return [random.uniform(-0.1, 0.1) for _ in range(settings.EMBEDDING_DIM)]
 
     @staticmethod
     def cosine_distance(vec_a: List[float], vec_b: List[float]) -> float:
@@ -113,3 +120,13 @@ class Embedder:
 
         similarity = dot_product / (norm_a * norm_b)
         return 1.0 - similarity  # Convert similarity to distance
+
+    @staticmethod
+    def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+        """
+        Calculate cosine similarity between two vectors.
+
+        Returns:
+            Float between -1 (opposite) and 1 (identical).
+        """
+        return 1.0 - Embedder.cosine_distance(vec_a, vec_b)

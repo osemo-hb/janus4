@@ -8,6 +8,11 @@ Simplified for Janus 3.5:
 - PostgreSQL for LTM (episodes, entities, facts)
 - Unified extractor for entity/fact extraction
 - OpenTelemetry tracing
+
+GPT-5.1 Upgrades:
+- Topic detector for LLM-based boundary detection
+- LLM reranker for relevance scoring
+- Memory distiller for compression
 """
 
 import logging
@@ -24,6 +29,9 @@ from janus3.core.retrieval import HybridRetriever
 from janus3.core.threshold import AdaptiveThreshold
 from janus3.core.threshold_store import ThresholdStore
 from janus3.core.agentic_chat import AgenticChatHandler
+from janus3.core.topic_detector import TopicDetector
+from janus3.core.reranker import LLMReranker
+from janus3.core.distillation import MemoryDistiller
 from janus3.db.connection import close_db_pool, get_db_pool, init_db_pool
 from janus3.db.stm import STMManager
 from janus3.services.llm_service import LLMService
@@ -36,6 +44,9 @@ _redis_client: Optional[redis.Redis] = None
 _threshold_cache: Dict[UUID, AdaptiveThreshold] = {}
 _threshold_store: Optional[ThresholdStore] = None
 _tavily_service: Optional[TavilyService] = None
+_topic_detector: Optional[TopicDetector] = None
+_reranker: Optional[LLMReranker] = None
+_distiller: Optional[MemoryDistiller] = None
 
 
 async def get_redis() -> redis.Redis:
@@ -144,9 +155,56 @@ def get_agentic_handler() -> AgenticChatHandler:
     return AgenticChatHandler(llm.client, tavily)
 
 
+def get_topic_detector() -> TopicDetector:
+    """
+    Get topic detector (singleton).
+
+    Returns:
+        TopicDetector instance for LLM-based boundary detection.
+    """
+    global _topic_detector
+
+    if _topic_detector is None:
+        _topic_detector = TopicDetector()
+
+    return _topic_detector
+
+
+def get_reranker() -> LLMReranker:
+    """
+    Get LLM reranker (singleton).
+
+    Returns:
+        LLMReranker instance for relevance scoring.
+    """
+    global _reranker
+
+    if _reranker is None:
+        _reranker = LLMReranker()
+
+    return _reranker
+
+
+def get_distiller() -> MemoryDistiller:
+    """
+    Get memory distiller (singleton).
+
+    Returns:
+        MemoryDistiller instance for memory compression.
+    """
+    global _distiller
+
+    if _distiller is None:
+        _distiller = MemoryDistiller()
+
+    return _distiller
+
+
 async def get_retriever() -> HybridRetriever:
     """
     Get hybrid retriever with all dependencies.
+
+    GPT-5.1: Injects reranker if enabled.
 
     Returns:
         HybridRetriever instance.
@@ -155,7 +213,10 @@ async def get_retriever() -> HybridRetriever:
     redis_client = await get_redis()
     embedder = get_embedder()
 
-    return HybridRetriever(db_pool, redis_client, embedder)
+    # Inject reranker if enabled
+    reranker = get_reranker() if settings.RERANKER_ENABLED else None
+
+    return HybridRetriever(db_pool, redis_client, embedder, reranker)
 
 
 async def get_stm_manager() -> STMManager:

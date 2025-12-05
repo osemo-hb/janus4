@@ -39,7 +39,9 @@ class EpisodeRepository:
         turn_end: int,
         summary_vector: List[float],
         centroid_vector: Optional[List[float]] = None,
-        user_turn_vectors: Optional[List[Tuple[int, List[float]]]] = None
+        user_turn_vectors: Optional[List[Tuple[int, List[float]]]] = None,
+        compressed_state: Optional[str] = None,
+        topic_label: Optional[str] = None
     ) -> Episode:
         """
         Create episode with vectors in a transaction.
@@ -52,6 +54,8 @@ class EpisodeRepository:
             summary_vector: Embedding of the summary.
             centroid_vector: Optional centroid of user turn vectors.
             user_turn_vectors: Optional list of (turn_index, vector) tuples.
+            compressed_state: Optional 20-40 word abstraction (GPT-5.1).
+            topic_label: Optional 2-3 word topic label (GPT-5.1).
 
         Returns:
             Created Episode object.
@@ -61,11 +65,13 @@ class EpisodeRepository:
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                # Insert episode
+                # Insert episode with optional compressed_state and topic_label
                 await conn.execute("""
-                    INSERT INTO episodes (id, session_id, summary, turn_start, turn_end)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, episode_id, session_id, summary, turn_start, turn_end)
+                    INSERT INTO episodes (id, session_id, summary, turn_start, turn_end,
+                                          compressed_state, topic_label)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, episode_id, session_id, summary, turn_start, turn_end,
+                    compressed_state, topic_label)
 
                 # Insert summary vector
                 summary_vec_id = uuid4()
@@ -331,3 +337,45 @@ class EpisodeRepository:
             """, session_id)
             # Extract count from "DELETE N"
             return int(result.split()[-1])
+
+    async def get_by_topic(
+        self,
+        session_id: UUID,
+        topic_label: str,
+        limit: int = 20
+    ) -> List[Episode]:
+        """
+        Get episodes with a specific topic label (GPT-5.1).
+
+        Args:
+            session_id: Session UUID.
+            topic_label: Topic label to filter by.
+            limit: Maximum results.
+
+        Returns:
+            List of Episode objects with matching topic.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, session_id, summary, turn_start, turn_end, created_at,
+                       compressed_state, topic_label
+                FROM episodes
+                WHERE session_id = $1 AND topic_label = $2
+                ORDER BY created_at DESC
+                LIMIT $3
+            """, session_id, topic_label, limit)
+
+            return [
+                Episode(
+                    id=row["id"],
+                    session_id=row["session_id"],
+                    summary=row["summary"],
+                    turn_start=row["turn_start"],
+                    turn_end=row["turn_end"],
+                    created_at=row["created_at"],
+                    vectors=[],
+                    compressed_state=row.get("compressed_state"),
+                    topic_label=row.get("topic_label")
+                )
+                for row in rows
+            ]

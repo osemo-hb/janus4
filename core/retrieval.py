@@ -3,13 +3,19 @@ Hybrid Retrieval System
 
 Implements Fix 2: Parallelized hot path for context building.
 Uses asyncio.gather to run entity and episode searches concurrently.
+
+GPT-5.1 Upgrades:
+- Optional LLM reranker for relevance scoring
+- Distilled memory search for compressed context
+- Compressed state support for episodes
 """
 
 import asyncio
+import logging
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, TYPE_CHECKING
 from uuid import UUID
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import asyncpg
 import redis.asyncio as redis
@@ -19,7 +25,14 @@ from core.embedder import Embedder
 from db.stm import STMManager
 from db.episodes import EpisodeRepository
 from db.facts import FactRepository, EntityRepository
+from db.distilled import DistilledMemoryRepository
+from core.distillation import DistilledMemory
 from config import settings
+
+if TYPE_CHECKING:
+    from core.reranker import LLMReranker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,6 +43,7 @@ class RetrievalContext:
     facts: List[Fact]
     stm_turns: List[Turn]
     stats: RetrievalStats
+    distilled_memories: List[Tuple[DistilledMemory, float]] = field(default_factory=list)
 
 
 class HybridRetriever:
@@ -39,13 +53,16 @@ class HybridRetriever:
     Fix 2: Parallelized hot path
     - Entity search and episode search run in PARALLEL
     - Graph traversal runs AFTER (depends on entity results)
+
+    GPT-5.1: Optional reranking and distilled memory support
     """
 
     def __init__(
         self,
         db_pool: asyncpg.Pool,
         redis_client: redis.Redis,
-        embedder: Embedder
+        embedder: Embedder,
+        reranker: Optional["LLMReranker"] = None
     ):
         """
         Initialize retriever.
@@ -54,16 +71,19 @@ class HybridRetriever:
             db_pool: asyncpg connection pool.
             redis_client: Async Redis client.
             embedder: Embedding service.
+            reranker: Optional LLM reranker for relevance scoring.
         """
         self.db_pool = db_pool
         self.redis = redis_client
         self.embedder = embedder
+        self.reranker = reranker
 
         # Initialize repositories
         self.stm = STMManager(redis_client)
         self.episode_repo = EpisodeRepository(db_pool)
         self.fact_repo = FactRepository(db_pool)
         self.entity_repo = EntityRepository(db_pool)
+        self.distilled_repo = DistilledMemoryRepository(db_pool)
 
     async def build_context(
         self,
@@ -75,9 +95,10 @@ class HybridRetriever:
         Build context for LLM response generation.
 
         Fix 2: Parallelized hot path
-        1. Run entity search and episode search in PARALLEL
+        1. Run entity search, episode search, and distilled search in PARALLEL
         2. Run graph traversal AFTER (depends on entities)
-        3. Get STM turns
+        3. Optionally rerank episodes
+        4. Get STM turns
 
         Args:
             query: User query text.
@@ -89,20 +110,31 @@ class HybridRetriever:
         """
         start_time = time.time()
 
-        # Step 1: PARALLEL - Entity and Episode search
-        entities_task = self._search_entities(query_vec, session_id)
-        episodes_task = self._search_episodes(query_vec, session_id)
+        # Calculate candidate count (3x if reranking enabled)
+        episode_limit = settings.RETRIEVAL_TOP_K_EPISODES
+        if self.reranker and settings.RERANKER_ENABLED:
+            episode_limit *= settings.RERANKER_CANDIDATE_MULTIPLIER
 
-        entities, episodes = await asyncio.gather(
+        # Step 1: PARALLEL - Entity, Episode, and Distilled search
+        entities_task = self._search_entities(query_vec, session_id)
+        episodes_task = self._search_episodes(query_vec, session_id, limit=episode_limit)
+        distilled_task = self._search_distilled(query_vec, session_id)
+
+        entities, episodes, distilled_memories = await asyncio.gather(
             entities_task,
-            episodes_task
+            episodes_task,
+            distilled_task
         )
 
-        # Step 2: SEQUENTIAL - Graph traversal (depends on entities)
+        # Step 2: Optional reranking of episodes
+        if self.reranker and settings.RERANKER_ENABLED and episodes:
+            episodes = await self._rerank_episodes(query, episodes)
+
+        # Step 3: SEQUENTIAL - Graph traversal (depends on entities)
         entity_ids = [e.id for e, _ in entities]
         facts = await self._search_graph(entity_ids, session_id)
 
-        # Step 3: Get recent STM turns
+        # Step 4: Get recent STM turns
         stm_turns = await self._get_stm_turns(session_id)
 
         elapsed_ms = (time.time() - start_time) * 1000
@@ -120,7 +152,8 @@ class HybridRetriever:
             episodes=episodes,
             facts=facts,
             stm_turns=stm_turns,
-            stats=stats
+            stats=stats,
+            distilled_memories=distilled_memories
         )
 
     async def _search_entities(
@@ -148,7 +181,8 @@ class HybridRetriever:
     async def _search_episodes(
         self,
         query_vec: List[float],
-        session_id: UUID
+        session_id: UUID,
+        limit: Optional[int] = None
     ) -> List[Tuple[Episode, float]]:
         """
         Vector similarity search on episodes (using summary vectors).
@@ -158,6 +192,7 @@ class HybridRetriever:
         Args:
             query_vec: Query embedding.
             session_id: Session UUID.
+            limit: Optional limit override.
 
         Returns:
             List of (Episode, similarity) tuples.
@@ -165,9 +200,82 @@ class HybridRetriever:
         return await self.episode_repo.search_by_summary(
             session_id=session_id,
             query_vector=query_vec,
-            limit=settings.RETRIEVAL_TOP_K_EPISODES,
+            limit=limit or settings.RETRIEVAL_TOP_K_EPISODES,
             min_similarity=0.4
         )
+
+    async def _search_distilled(
+        self,
+        query_vec: List[float],
+        session_id: UUID
+    ) -> List[Tuple[DistilledMemory, float]]:
+        """
+        Vector similarity search on distilled memories.
+
+        Args:
+            query_vec: Query embedding.
+            session_id: Session UUID.
+
+        Returns:
+            List of (DistilledMemory, similarity) tuples.
+        """
+        if not settings.DISTILLATION_ENABLED:
+            return []
+
+        try:
+            return await self.distilled_repo.search_similar(
+                query_vec=query_vec,
+                session_id=session_id,
+                limit=settings.RERANKER_TOP_K,
+                min_similarity=0.5
+            )
+        except Exception as e:
+            logger.warning(f"Distilled memory search failed: {e}")
+            return []
+
+    async def _rerank_episodes(
+        self,
+        query: str,
+        episodes: List[Tuple[Episode, float]]
+    ) -> List[Tuple[Episode, float]]:
+        """
+        Rerank episodes using LLM relevance scoring.
+
+        Args:
+            query: User query text.
+            episodes: List of (Episode, similarity) tuples.
+
+        Returns:
+            Reranked list of (Episode, similarity) tuples.
+        """
+        if not self.reranker:
+            return episodes
+
+        try:
+            # Extract episodes and scores
+            episode_list = [ep for ep, _ in episodes]
+            scores = [score for _, score in episodes]
+
+            # Format episodes for reranker (prefer compressed_state)
+            def format_episode(ep: Episode) -> str:
+                content = getattr(ep, 'compressed_state', None) or ep.summary
+                return f"[Turns {ep.turn_start}-{ep.turn_end}] {content}"
+
+            # Rerank
+            ranked = await self.reranker.rerank(
+                query=query,
+                items=episode_list,
+                item_formatter=format_episode,
+                top_k=settings.RERANKER_TOP_K,
+                original_scores=scores
+            )
+
+            # Convert back to (Episode, score) tuples
+            return [(r.item, r.rerank_score) for r in ranked]
+
+        except Exception as e:
+            logger.warning(f"Episode reranking failed: {e}")
+            return episodes[:settings.RERANKER_TOP_K]
 
     async def _search_graph(
         self,
@@ -259,6 +367,8 @@ class ContextBuilder:
         """
         Build a system prompt with context.
 
+        GPT-5.1: Uses compressed_state when available, includes distilled memories.
+
         Args:
             context: RetrievalContext object.
             base_prompt: Optional base system prompt.
@@ -272,19 +382,33 @@ class ContextBuilder:
         parts = [base_prompt]
         parts.append("\nUse the following context to inform your response:\n")
 
-        # Format knowledge graph
+        # Format knowledge graph (use canonical predicates when available)
         if context.facts:
             parts.append("KNOWN FACTS:")
             entity_map = {e.id: e.name for e, _ in context.entities}
             for fact in context.facts:
                 entity_name = entity_map.get(fact.subject_entity_id, "Unknown")
-                parts.append(f"- {entity_name} {fact.predicate}: {fact.object}")
+                predicate = getattr(fact, 'canonical_predicate', None) or fact.predicate
+                parts.append(f"- {entity_name} {predicate}: {fact.object}")
 
-        # Format episodes
+        # Format distilled memories (compressed summaries)
+        if context.distilled_memories:
+            parts.append("\nDISTILLED MEMORIES:")
+            for memory, _ in context.distilled_memories[:3]:  # Top 3 distilled
+                topic = memory.topic_cluster or "general"
+                parts.append(f"- [{topic}] {memory.compressed_content}")
+
+        # Format episodes (prefer compressed_state)
         if context.episodes:
             parts.append("\nRELEVANT PAST CONVERSATIONS:")
             for episode, _ in context.episodes[:3]:  # Top 3 episodes
-                parts.append(f"- {episode.summary}")
+                # Use compressed_state if available, otherwise summary
+                content = getattr(episode, 'compressed_state', None) or episode.summary
+                topic = getattr(episode, 'topic_label', None)
+                if topic:
+                    parts.append(f"- [{topic}] {content}")
+                else:
+                    parts.append(f"- {content}")
 
         # Format recent conversation
         if context.stm_turns:

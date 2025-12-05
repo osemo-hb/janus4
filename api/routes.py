@@ -41,7 +41,9 @@ from .dependencies import (
     get_stm_manager,
     get_threshold,
     get_threshold_store,
+    get_topic_detector,
 )
+from janus3.core.topic_detector import Turn as TopicTurn
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -265,16 +267,19 @@ async def chat(session_id: UUID, request: ChatRequest):
         embedder = get_embedder()
         retriever = await get_retriever()
         llm = get_llm_service()
-        threshold = get_threshold(session_id)
         stm = await get_stm_manager()
+        topic_detector = get_topic_detector()
 
         # 1. Embed user query
         with tracer.start_as_current_span("embed_query"):
             query_vec = await embedder.encode(request.content)
 
-        # 2. Get current turn count
+        # 2. Get current turn count and recent turns for topic detection
         stm_length = await stm.get_stream_length(session_id)
         turn_number = stm_length + 1
+
+        # Get recent turns for topic detection
+        recent_turns = await stm.get_recent_turns(session_id, count=settings.TOPIC_DETECTION_CONTEXT_TURNS)
 
         # 3. Store user message in STM
         with tracer.start_as_current_span("store_user_turn"):
@@ -286,13 +291,28 @@ async def chat(session_id: UUID, request: ChatRequest):
                 turn_index=turn_number,
             )
 
-        # 4. Check adaptive threshold for topic boundary
-        with tracer.start_as_current_span("check_threshold"):
-            velocity, is_boundary = threshold.update(query_vec)
-            span.set_attribute("velocity", velocity)
-            span.set_attribute("is_boundary", is_boundary)
+        # 4. Detect topic boundary (LLM or fallback to semantic velocity)
+        with tracer.start_as_current_span("check_topic_boundary"):
+            if settings.TOPIC_DETECTION_ENABLED:
+                # Convert STM turns to TopicTurn format
+                topic_turns = [
+                    TopicTurn(role=t.role, content=t.content)
+                    for t in recent_turns
+                ]
+                boundary_result = await topic_detector.detect_boundary(
+                    topic_turns, request.content
+                )
+                is_boundary = boundary_result.is_boundary
+                span.set_attribute("topic_label", boundary_result.topic_label)
+                span.set_attribute("topic_confidence", boundary_result.confidence)
+            else:
+                # Fallback to semantic velocity
+                threshold = get_threshold(session_id)
+                velocity, is_boundary = threshold.update(query_vec)
+                span.set_attribute("velocity", velocity)
+                metrics.threshold_velocities.observe(velocity)
 
-            metrics.threshold_velocities.observe(velocity)
+            span.set_attribute("is_boundary", is_boundary)
 
         # If boundary detected, signal consolidation via pub/sub
         if is_boundary:

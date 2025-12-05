@@ -9,6 +9,11 @@ This is the core of the Cortex pipeline, triggered by:
 - Topic boundary signals (semantic shift detected)
 - Periodic consolidation (time-based)
 
+GPT-5.1 Upgrades:
+- Compressed state and topic label for episodes
+- Canonical predicates for facts
+- Memory distillation for compression
+
 Usage:
     service = await ConsolidationService.get_instance()
     result = await service.consolidate(session_id, turns, reason)
@@ -26,10 +31,12 @@ import numpy as np
 from janus3.config import settings
 from janus3.core.embedder import Embedder
 from janus3.core.unified_extractor import UnifiedExtractor, ExtractedEntity, ExtractedFact
+from janus3.core.distillation import MemoryDistiller
 from janus3.core.models import ConsolidationResult
 from janus3.db.connection import get_db_pool
 from janus3.db.episodes import EpisodeRepository
 from janus3.db.facts import EntityRepository, FactRepository
+from janus3.db.distilled import DistilledMemoryRepository
 from janus3.infra.metrics import metrics
 from janus3.infra.tracing import tracer
 
@@ -63,13 +70,16 @@ class ConsolidationService:
         if ConsolidationService._initialized:
             return
 
-        logger.info("Initializing ConsolidationService (Janus 3.5)")
+        logger.info("Initializing ConsolidationService (Janus 3.5 with GPT-5.1 upgrades)")
 
         # Initialize embedder
         self.embedder = Embedder()
 
         # Initialize unified extractor (replaces EntityLinker + HybridFactExtractor)
         self.extractor = UnifiedExtractor()
+
+        # Initialize memory distiller
+        self.distiller = MemoryDistiller()
 
         # Get database pool
         self.db_pool = await get_db_pool()
@@ -138,7 +148,7 @@ class ConsolidationService:
         turns: List[Dict[str, Any]],
         reason: str,
     ) -> ConsolidationResult:
-        """Internal consolidation logic - Janus 3.5 simplified."""
+        """Internal consolidation logic - Janus 3.5 with GPT-5.1 upgrades."""
         start_time = datetime.utcnow()
 
         # 1. Format conversation text
@@ -148,12 +158,20 @@ class ConsolidationService:
             turn_start = min(turn_indices) if turn_indices else 0
             turn_end = max(turn_indices) if turn_indices else 0
 
-        # 2. Unified extraction (entities + facts + summary in one LLM call)
+        # 2. Unified extraction (entities + facts + summary + compressed state)
         with tracer.start_as_current_span("unified_extraction") as span:
             async with self.llm_semaphore:
                 extraction = await self.extractor.extract(text_block)
             span.set_attribute("entity_count", len(extraction.entities))
             span.set_attribute("fact_count", len(extraction.facts))
+
+            # Extract compressed state and topic label (GPT-5.1)
+            compressed_state = None
+            topic_label = None
+            if extraction.episode_state:
+                compressed_state = extraction.episode_state.compressed
+                topic_label = extraction.episode_state.topic_label
+                span.set_attribute("topic_label", topic_label or "unknown")
 
         # 3. Generate embeddings
         with tracer.start_as_current_span("generate_embeddings"):
@@ -167,7 +185,7 @@ class ConsolidationService:
             # Get individual user turn vectors (first 3 for anchoring)
             user_turn_vectors = await self._get_user_turn_vectors(turns)
 
-        # 4. Create episode in PostgreSQL
+        # 4. Create episode in PostgreSQL (with compressed state + topic label)
         with tracer.start_as_current_span("create_episode") as span:
             episode_repo = EpisodeRepository(self.db_pool)
 
@@ -179,10 +197,12 @@ class ConsolidationService:
                 summary_vector=summary_vec,
                 centroid_vector=centroid_vec,
                 user_turn_vectors=user_turn_vectors,
+                compressed_state=compressed_state,  # GPT-5.1
+                topic_label=topic_label,  # GPT-5.1
             )
             span.set_attribute("episode_id", str(episode.id))
 
-        # 5. Persist entities and facts to PostgreSQL (simple upsert)
+        # 5. Persist entities and facts to PostgreSQL (with canonical predicates)
         with tracer.start_as_current_span("persist_entities_facts"):
             entities_created, facts_created = await self._persist_to_postgres(
                 session_id=session_id,
@@ -190,6 +210,10 @@ class ConsolidationService:
                 entities=extraction.entities,
                 facts=extraction.facts,
             )
+
+        # 6. Check if distillation should be triggered (GPT-5.1)
+        if settings.DISTILLATION_ENABLED and topic_label:
+            await self._maybe_distill(session_id, topic_label)
 
         # Record metrics
         duration = (datetime.utcnow() - start_time).total_seconds()
@@ -203,6 +227,7 @@ class ConsolidationService:
             f"episode={episode.id}, "
             f"entities={entities_created}, "
             f"facts={facts_created}, "
+            f"topic={topic_label or 'unknown'}, "
             f"duration={duration:.2f}s"
         )
 
@@ -295,7 +320,7 @@ class ConsolidationService:
             entity_map[e.name.lower().strip()] = entity.id
             entities_created += 1
 
-        # 2. Create/upsert facts
+        # 2. Create/upsert facts (with canonical predicates - GPT-5.1)
         for f in facts:
             # Find or create subject entity
             subject_key = f.subject.lower().strip()
@@ -313,7 +338,7 @@ class ConsolidationService:
 
             subject_entity_id = entity_map[subject_key]
 
-            # Upsert fact (simple overwrite, no versioning)
+            # Upsert fact (with canonical predicate and source span - GPT-5.1)
             await fact_repo.upsert_fact(
                 session_id=session_id,
                 subject_entity_id=subject_entity_id,
@@ -321,7 +346,59 @@ class ConsolidationService:
                 object_value=f.object_value,
                 confidence=0.9,  # Default confidence from unified extractor
                 source_episode_id=episode_id,
+                canonical_predicate=f.canonical_predicate,  # GPT-5.1
+                source_span=f.source_span,  # GPT-5.1
             )
             facts_created += 1
 
         return entities_created, facts_created
+
+    async def _maybe_distill(self, session_id: UUID, topic_label: str) -> None:
+        """Check if distillation should be triggered for this topic cluster."""
+        if not settings.DISTILLATION_ENABLED:
+            return
+
+        try:
+            with tracer.start_as_current_span("check_distillation"):
+                # Get episodes with same topic label
+                episode_repo = EpisodeRepository(self.db_pool)
+                episodes = await episode_repo.get_by_topic(
+                    session_id=session_id,
+                    topic_label=topic_label,
+                    limit=settings.DISTILLATION_MIN_EPISODES + 5
+                )
+
+                # Check if we have enough episodes to distill
+                if len(episodes) >= settings.DISTILLATION_MIN_EPISODES:
+                    logger.info(
+                        f"Triggering distillation for topic '{topic_label}' "
+                        f"with {len(episodes)} episodes"
+                    )
+
+                    # Format episodes for distillation
+                    episode_dicts = [
+                        {
+                            'id': e.id,
+                            'summary': e.summary,
+                            'compressed_state': getattr(e, 'compressed_state', None),
+                            'created_at': e.created_at
+                        }
+                        for e in episodes
+                    ]
+
+                    # Perform distillation
+                    distilled = await self.distiller.distill_episodes(
+                        episode_dicts, session_id
+                    )
+
+                    if distilled:
+                        # Store distilled memory
+                        distilled_repo = DistilledMemoryRepository(self.db_pool)
+                        await distilled_repo.store(distilled)
+                        logger.info(
+                            f"Created distilled memory {distilled.id} "
+                            f"for topic '{topic_label}'"
+                        )
+
+        except Exception as e:
+            logger.warning(f"Distillation check failed: {e}")

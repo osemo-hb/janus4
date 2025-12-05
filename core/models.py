@@ -72,6 +72,8 @@ class Episode(BaseModel):
     turn_end: int
     created_at: datetime
     vectors: List[EpisodeVector] = Field(default_factory=list)
+    compressed_state: Optional[str] = None  # GPT-5.1: 20-40 word abstraction
+    topic_label: Optional[str] = None  # GPT-5.1: 2-3 word topic
 
     class Config:
         frozen = True
@@ -88,6 +90,8 @@ class Fact(BaseModel):
     source_episode_id: Optional[UUID] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    canonical_predicate: Optional[str] = None  # GPT-5.1: schema.org-style
+    source_span: Optional[str] = None  # GPT-5.1: provenance text
 
     class Config:
         frozen = True
