@@ -1,6 +1,24 @@
-# Janus 4.0
+<p align="center">
+<img width="1024" height="335" alt="image" src="https://github.com/user-attachments/assets/b17d78e5-73af-4726-a02a-04527d8f088e" />
+</p>
 
-Dual-process conversational memory backend for stateful LLM applications.
+<h1 align="center">Janus 4.0
+  
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://hub.docker.com/)
+[![Status](https://img.shields.io/badge/status-active_development-success.svg)]()
+
+</h1>
+
+<p align="center">
+  Dual-process conversational memory backend for stateful LLM applications.<br/>
+  FastAPI • Redis Streams • Postgres + pgvector • LLM Distillation
+</p>
+
+<p align="center">
+  <b>Drop-in memory for any LLM agent.</b>
+</p>
 
 Separates **latency-critical chat handling** from **asynchronous memory consolidation**:
 
