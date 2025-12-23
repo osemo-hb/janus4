@@ -24,8 +24,9 @@ Janus 4.0 is a dual-process memory backend for stateful LLM applications.
 It is built with a fundamental tension in mind: memory consolidation (extracting entities, facts, and summaries) is slow, but chat responses need to be fast.
 Janus decouples these concerns:
 
-API server — low-latency chat, queues work to Redis Streams
-Consumer process — async memory consolidation into PostgreSQL
+API server —> low-latency chat, queues work to Redis Streams
+
+Consumer process —> async memory consolidation into PostgreSQL
 
 Result: sub-100ms time-to-first-token without sacrificing persistent, structured long-term memory.
 Separates **latency-critical chat handling** from **asynchronous memory consolidation**:
