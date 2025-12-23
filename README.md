@@ -1,90 +1,109 @@
-# Janus3 Production-Ready Memory System
+# Janus 4.0
 
-A dual-process conversational memory system with episodic memory, knowledge graph, and vector search.
+Dual-process conversational memory backend for stateful LLM applications.
+
+Separates **latency-critical chat handling** from **asynchronous memory consolidation**:
+
+- Sub-100ms time-to-first-token
+- Structured long-term memory (episodes, entities, facts)
+- Crash-safe background processing
+- Memory growth without blocking requests
+
+Ships as a **reusable library** (`janus-core`) and **reference FastAPI server** (`janus-app`).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  NERVOUS SYSTEM (FastAPI)                                       │
-│  Handles: Chat requests with <100ms TTFT                        │
-│  - Parallel entity/episode retrieval (Fix 2)                    │
-│  - Redis Streams STM (Fix 1)                                    │
-│  - Adaptive threshold detection (Fix 4)                         │
-└─────────────────────────────────────────────────────────────────┘
-                             │
-                             ▼ (Redis Streams)
-┌─────────────────────────────────────────────────────────────────┐
-│  CORTEX (Native asyncio Consumer)                               │
-│  Handles: Memory consolidation                                  │
-│  - LLM summarization                                            │
-│  - Fact extraction                                              │
-│  - XACK/XAUTOCLAIM crash recovery (Fix 1, Fix 5)                │
-└─────────────────────────────────────────────────────────────────┘
+Client
+  ↓
+FastAPI App ─── Redis Streams (STM) ─── Async Consumer ─── PostgreSQL + pgvector (LTM)
+  │                                           │
+  ├─ Chat API                                 ├─ Unified extraction
+  ├─ Optional tool calling                    ├─ Embedding
+  └─ Short-term memory                        ├─ Topic boundary detection
+                                              └─ Memory consolidation
 ```
+
+**Core invariant:** User-facing latency is never blocked by memory consolidation.
+
+## Repository Structure
+
+```
+janus/
+├── libs/janus-core/       # Memory system library (no HTTP dependencies)
+├── server/janus-app/      # FastAPI reference implementation
+├── docs/ARCHITECTURE.md   # System internals
+├── docker-compose.yml     # PostgreSQL + Redis
+└── pyproject.toml         # uv workspace
+```
+
+## Components
+
+### janus-core
+
+Pure Python library, embeddable in any application.
+
+- OpenAI embeddings (configurable model + dimensionality)
+- Unified LLM extraction (entities, facts, summaries in one call)
+- LLM-based topic boundary detection
+- Hybrid retrieval (episodes + entities + facts)
+- Optional LLM reranking
+- Memory distillation (episode compression)
+- STM → LTM consolidation pipeline
+- PostgreSQL + Redis repositories
+- Standalone async consumer with crash recovery
+
+### janus-app
+
+Production-ready FastAPI server demonstrating `janus-core` usage.
+
+- Session-based chat API
+- Optional agentic tool-calling (Tavily web search)
+- Dependency injection + lifecycle management
+- OpenTelemetry tracing, Prometheus metrics
+
+## Requirements
+
+- Python 3.10+
+- PostgreSQL 14+ with `pgvector`
+- Redis 6+
+- OpenAI API key
+- (Optional) Tavily API key
 
 ## Quick Start
 
-### 1. Start Infrastructure
-
 ```bash
-cd janus3
+# 1. Start infrastructure
 docker-compose up -d
-```
 
-This starts:
-- PostgreSQL with pgvector extension
-- Redis for STM streams
+# 2. Install dependencies
+uv sync
 
-### 2. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configure Environment
-
-```bash
+# 3. Configure environment
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
-```
+# Set OPENAI_API_KEY (required), TAVILY_API_KEY (optional)
 
-### 4. Run Migrations
+# 4. Start API server
+uvicorn janus_app.main:app --reload
 
-The migrations run automatically when PostgreSQL starts (via docker-entrypoint-initdb.d).
-
-### 5. Start the API
-
-```bash
-uvicorn api.main:app --reload
-```
-
-API available at: http://localhost:8000
-
-### 6. Start the Consumer (separate terminal)
-
-```bash
-python -m consumer.run_consumer
+# 5. Start background consumer
+janus-consumer
+# or: python -m janus_core.consumer.runner
 ```
 
 ## API Endpoints
 
-### Sessions
-
-- `POST /api/v1/sessions` - Create new session
-- `GET /api/v1/sessions/{id}` - Get session info
-- `DELETE /api/v1/sessions/{id}` - Delete session
-
-### Chat
-
-- `POST /api/v1/sessions/{id}/chat` - Send message
-
-### Debug
-
-- `GET /api/v1/sessions/{id}/stm` - View STM
-- `GET /api/v1/sessions/{id}/episodes` - View episodes
-- `GET /api/v1/sessions/{id}/facts` - View facts
-- `GET /api/v1/sessions/{id}/threshold` - View threshold stats
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/v1/sessions` | Create session |
+| `GET /api/v1/sessions/{id}` | Get session info |
+| `DELETE /api/v1/sessions/{id}` | Delete session (GDPR-compliant) |
+| `POST /api/v1/sessions/{id}/chat` | Send message |
+| `GET /api/v1/sessions/{id}/stm` | Debug: short-term memory |
+| `GET /api/v1/sessions/{id}/episodes` | Debug: episodes |
+| `GET /api/v1/sessions/{id}/facts` | Debug: facts |
+| `GET /api/v1/health` | Health check |
+| `GET /api/v1/metrics` | Prometheus metrics |
 
 ## Example Usage
 
@@ -95,48 +114,43 @@ import httpx
 resp = httpx.post("http://localhost:8000/api/v1/sessions")
 session_id = resp.json()["session_id"]
 
-# Chat
+# Chat (memory persists across messages)
 resp = httpx.post(
     f"http://localhost:8000/api/v1/sessions/{session_id}/chat",
     json={"content": "My wife is vegetarian and we're planning a dinner party."}
 )
 print(resp.json()["assistant_message"])
-
-# Chat again (memory should persist)
-resp = httpx.post(
-    f"http://localhost:8000/api/v1/sessions/{session_id}/chat",
-    json={"content": "What dietary restrictions should I consider for dinner?"}
-)
-print(resp.json()["assistant_message"])  # Should mention vegetarian wife
 ```
 
-## Key Fixes Implemented
+## Configuration
 
-| Fix | Issue | Solution |
-|-----|-------|----------|
-| 1 | Race condition in STM | Redis Streams with XREADGROUP/XACK |
-| 2 | Sequential retrieval | asyncio.gather for parallel search |
-| 3 | Full table scan | Two partial HNSW indexes |
-| 4 | Cold start threshold | Pre-calculated velocities |
-| 5 | RQ/Streams conflict | Native asyncio consumer |
+Key settings (see `.env.example`):
 
-## Running Tests
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
+| `TAVILY_API_KEY` | No | Web search |
+| `EMBEDDING_MODEL` | No | Embedding model |
+| `EMBEDDING_DIM` | No | Embedding dimensions |
+| `GENERATION_MODEL` | No | Generation model |
+| `TOPIC_DETECTION_ENABLED` | No | LLM topic detection |
+| `RERANKER_ENABLED` | No | LLM reranking |
+| `DISTILLATION_ENABLED` | No | Memory distillation |
 
-```bash
-pytest tests/ -v
-```
+Core settings: `janus_core.config`  
+App settings: `janus_app.config`
 
-## File Structure
+## Use Cases
 
-```
-janus3/
-├── api/              # FastAPI (Nervous System)
-├── consumer/         # Native Stream Consumer (Cortex)
-├── core/             # Business logic
-├── db/               # Database layer
-├── services/         # External services (LLM)
-├── tests/            # Test suite
-├── config.py         # Settings
-├── docker-compose.yml
-└── requirements.txt
-```
+- Stateful chat applications
+- AI assistants with long-term memory
+- Research systems exploring conversational memory
+- Internal tools requiring persistent semantic context
+
+## Status
+
+Stable architectural baseline. Possible future work: user-level memory scopes, cost/latency budgeting, deterministic control-plane fallbacks.
+
+## License
+
+[Add license here]
