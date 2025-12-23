@@ -1,5 +1,5 @@
 <p align="center">
-<img width="1024" height="335" alt="image" src="https://github.com/user-attachments/assets/b17d78e5-73af-4726-a02a-04527d8f088e" />
+<img width="1024" height="335" alt="image" src="https://github.com/user-attachments/assets/bfc41183-e3c4-45cb-9cc3-24c91b1285d3" />
 </p>
 
 <h1 align="center">Janus 4.0
