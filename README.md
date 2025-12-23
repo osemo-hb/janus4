@@ -24,6 +24,8 @@ FastAPI App ─── Redis Streams (STM) ─── Async Consumer ─── Pos
                                               └─ Memory consolidation
 ```
 
+See [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) for details.
+
 **Core invariant:** User-facing latency is never blocked by memory consolidation.
 
 ## Repository Structure
@@ -153,4 +155,4 @@ Stable architectural baseline. Possible future work: user-level memory scopes, c
 
 ## License
 
-[Add license here]
+MIT License. See [`LICENSE`](LICENSE).
